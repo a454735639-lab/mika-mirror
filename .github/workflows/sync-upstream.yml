@@ -104,6 +104,14 @@ jobs:
           cp -a /tmp/keep/sync-upstream.yml .github/workflows/ 2>/dev/null || true
           cp -a /tmp/keep/MIRROR.md . 2>/dev/null || true
 
+          # 上游自带的 CI（ci.yml）是给上游构建/测试用的，在本镜像仓库里只会空转，
+          # 而且每个 tag 都会推一次、触发一次构建。这里改名成 .disabled，保留内容可对照但不运行。
+          if [ -f .github/workflows/ci.yml ]; then
+            mv .github/workflows/ci.yml .github/workflows/ci.yml.disabled
+            echo "已禁用上游 ci.yml（重命名为 ci.yml.disabled）"
+          fi
+          ls -la .github/workflows/
+
           test -f .github/workflows/sync-upstream.yml || { echo "::error::工作流文件丢失"; exit 1; }
           echo "当前文件数：$(find . -path ./.git -prune -o -type f -print | wc -l)"
 
