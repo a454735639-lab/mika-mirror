@@ -1,0 +1,229 @@
+name: sync-upstream
+
+# 每天 03:00 UTC（北京时间 11:00）检查上游 wangzan101/Mika 是否有新 release。
+# 有则：拉取该 tag 的源码快照 → 提交到 main → 打 tag → 建 release 并上传全部安装包。
+# 手动触发：Actions → sync-upstream → Run workflow
+#   tag: 指定上游 tag（留空=自动取 latest）
+#   force: 忽略「本地已有该 tag」的跳过判断，强制重跑一遍
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定上游 tag（留空=自动取 latest）'
+        required: false
+        default: ''
+      force:
+        description: '强制重跑（忽略已有 tag）'
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: '只检查不推送'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: wangzan101/Mika
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream release
+        id: up
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            REL=$(curl -sf "https://api.github.com/repos/$UPSTREAM/releases/tags/$TAG") || {
+              echo "::error::上游没有 release $TAG"; exit 1; }
+          else
+            REL=$(curl -sf "https://api.github.com/repos/$UPSTREAM/releases/latest")
+            TAG=$(echo "$REL" | jq -r .tag_name)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "上游版本：$TAG"
+
+          if [ "${{ inputs.force }}" != "true" ] && git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "本地已有 $TAG，跳过（要重跑请勾 force）"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "$REL" | jq -r '.assets[] | "\(.name)\t\(.browser_download_url)"' > /tmp/assets.tsv
+          echo "上游资产数：$(wc -l < /tmp/assets.tsv)"
+
+      - name: Download source snapshot
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.up.outputs.tag }}"
+          URL="https://github.com/$UPSTREAM/archive/refs/tags/$TAG.tar.gz"
+          echo "下载 $URL"
+          curl -fL --retry 4 --retry-delay 5 --max-time 600 -o /tmp/src.tar.gz "$URL"
+          gzip -t /tmp/src.tar.gz
+          mkdir -p /tmp/extract
+          tar xzf /tmp/src.tar.gz -C /tmp/extract
+          SRC=$(find /tmp/extract -maxdepth 1 -mindepth 1 -type d | head -1)
+          echo "解压到 $SRC（$(find "$SRC" -type f | wc -l) 文件）"
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+
+      - name: Replace tree, keep mirror files
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          # 备份本仓库自己维护的文件（工作流 + 说明），它们不在上游快照里
+          mkdir -p /tmp/keep
+          cp -a .github/workflows/sync-upstream.yml /tmp/keep/ 2>/dev/null || true
+          cp -a MIRROR.md /tmp/keep/ 2>/dev/null || true
+
+          # 清空工作区（保留 .git），换成上游快照
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$SRC"/. .
+
+          # 还原本仓库自己的文件
+          mkdir -p .github/workflows
+          cp -a /tmp/keep/sync-upstream.yml .github/workflows/ 2>/dev/null || true
+          cp -a /tmp/keep/MIRROR.md . 2>/dev/null || true
+
+          test -f .github/workflows/sync-upstream.yml || { echo "::error::工作流文件丢失"; exit 1; }
+          echo "当前文件数：$(find . -path ./.git -prune -o -type f -print | wc -l)"
+
+      - name: Download release assets
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assets
+          while IFS=$'\t' read -r name url; do
+            [ -z "$name" ] && continue
+            echo "→ $name"
+            curl -fL --retry 4 --retry-delay 5 --max-time 900 -o "/tmp/assets/$name" "$url"
+          done < /tmp/assets.tsv
+          cd /tmp/assets && sha256sum * > /tmp/assets.sha256
+          cat /tmp/assets.sha256
+
+      - name: Rewrite MIRROR.md
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.up.outputs.tag }}"
+          {
+            echo "# Mika 镜像说明（非上游官方仓库）"
+            echo
+            echo "本仓库是 **[wangzan101/Mika](https://github.com/wangzan101/Mika)** 标签 \`$TAG\` 的**只读镜像备份**，"
+            echo "用于在国内网络环境下稳定获取源码与安装包。所有代码版权归上游作者，许可为 **Apache-2.0**（见 \`LICENSE\` / \`NOTICE\`）。"
+            echo
+            echo "- 上游仓库：https://github.com/wangzan101/Mika"
+            echo "- 上游官网：https://mikaphone.com"
+            echo "- 镜像同步时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- 同步方式：GitHub Actions 每日自动比对上游 release（见 \`.github/workflows/sync-upstream.yml\`）"
+            echo
+            echo "## 下载（本仓库 Release \`$TAG\`）"
+            echo
+            echo "| 文件 | 大小 (B) | SHA-256 |"
+            echo "|---|---|---|"
+            while read -r sha f; do
+              sz=$(stat -c%s "/tmp/assets/$f" 2>/dev/null || echo '?')
+              echo "| \`$f\` | $sz | \`$sha\` |"
+            done < /tmp/assets.sha256
+            echo
+            echo "所有附件与上游 GitHub 发布物**字节级一致**（SHA-256 由 GitHub Release API 回传的 digest 交叉核对）。"
+            echo
+            echo "## 安装前须知"
+            echo
+            echo "- APK 由上游作者签名，**本镜像未重新打包**。安装时若提示「未知来源」，属正常。"
+            echo "- 需要 **Android 11+**（聊天/网页/文件）；**操作其他 App 需 Android 12+，推荐 14+**；Linux 沙箱需 **arm64**。"
+            echo "- 首次使用要在设置里填**自己的模型 API Key**（或登录 ChatGPT / xAI / OpenRouter 账号），作者不提供任何模型额度。"
+            echo "- 操作第三方 App 可能违反其服务条款，重要操作建议用 Ask 模式逐笔确认。"
+            echo
+            echo "## 免责"
+            echo
+            echo "本仓库仅作镜像备份，不提供任何担保，问题请反馈给上游作者。"
+          } > MIRROR.md
+          head -30 MIRROR.md
+
+      - name: Commit, tag, push
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.up.outputs.tag }}"
+          git config user.name  "mika-mirror-bot"
+          git config user.email "mika-mirror-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "内容无变化，仅补 tag"
+          else
+            git commit -m "Mirror Mika $TAG (upstream wangzan101/Mika, Apache-2.0)"
+          fi
+          git tag -f "$TAG"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run=true，跳过推送"
+            git log --oneline -1
+            exit 0
+          fi
+          git push origin HEAD:main
+          git push -f origin "$TAG"
+
+      - name: Publish release with assets
+        if: steps.up.outputs.skip == 'false' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.up.outputs.tag }}"
+          REPO="${{ github.repository }}"
+          BODY=$(printf '镜像自上游 [wangzan101/Mika](https://github.com/wangzan101/Mika) 标签 `%s`。\n\n附件为上游原版发布物，SHA-256 见 `MIRROR.md`。上游许可 Apache-2.0，本仓库仅作备份，问题请反馈给上游作者。\n\n上游发布页：https://github.com/wangzan101/Mika/releases/tag/%s' "$TAG" "$TAG")
+
+          EXISTING=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" | jq -r .id 2>/dev/null || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "release 已存在（id=$EXISTING），复用"
+            REL_ID="$EXISTING"
+          else
+            REL_ID=$(curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -d "$(jq -n --arg t "$TAG" --arg n "Mika $TAG (mirror)" --arg b "$BODY" \
+                    '{tag_name:$t,name:$n,body:$b,draft:false,prerelease:false}')" \
+              "https://api.github.com/repos/$REPO/releases" | jq -r .id)
+            echo "新建 release id=$REL_ID"
+          fi
+
+          while IFS=$'\t' read -r name url; do
+            [ -z "$name" ] && continue
+            echo "上传 $name"
+            code=$(curl -sS -o /tmp/up.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@/tmp/assets/$name" \
+              "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$name")
+            echo "  http=$code $(jq -r '.name // .message' /tmp/up.json)"
+            [ "$code" = "201" ] || [ "$code" = "422" ] || exit 1
+          done < /tmp/assets.tsv
+
+      - name: Summary
+        run: |
+          {
+            echo "### 同步结果"
+            echo "- 上游版本：\`${{ steps.up.outputs.tag }}\`"
+            echo "- 跳过：\`${{ steps.up.outputs.skip }}\`"
+            echo "- dry_run：\`${{ inputs.dry_run }}\`"
+            echo "- 仓库：https://github.com/${{ github.repository }}"
+          } >> "$GITHUB_STEP_SUMMARY"
