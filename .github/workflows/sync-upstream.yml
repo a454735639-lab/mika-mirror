@@ -114,9 +114,23 @@ jobs:
             echo "DRIFT_EOF"
           } >> "$GITHUB_OUTPUT"
 
-          jq -n --arg spdx "$SPDX" --arg lic "$LIC_SHA" --arg not "$NOT_SHA" \
+          NEW=$(jq -n --arg spdx "$SPDX" --arg lic "$LIC_SHA" --arg not "$NOT_SHA" \
                 --arg arch "$ARCHIVED" \
-                '{spdx:$spdx,license_sha256:$lic,notice_sha256:$not,archived:$arch}' > "$BASE"
+                '{spdx:$spdx,license_sha256:$lic,notice_sha256:$not,archived:$arch}')
+
+          if [ "$DRIFT" = "true" ]; then
+            # 有漂移：只写待确认文件，不覆盖基线。
+            # 这样在人工确认之前，每次运行都会继续判定为漂移（不会静默吞掉变化）。
+            printf '%s\n' "$NEW" > .mirror-baseline.pending.json
+            echo "漂移未确认，基线保持不变，待确认值写入 .mirror-baseline.pending.json"
+            echo "baseline_json<<BASE_EOF" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$NEW" >> "$GITHUB_OUTPUT"
+            echo "BASE_EOF" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$NEW" > "$BASE"
+            rm -f .mirror-baseline.pending.json
+            echo "基线已更新（无漂移）"
+          fi
           cat "$BASE"
 
       - name: Resolve upstream release
@@ -305,13 +319,31 @@ jobs:
         if: inputs.dry_run != true
         run: |
           set -euo pipefail
+          git config user.name  "mika-mirror-bot"
+          git config user.email "mika-mirror-bot@users.noreply.github.com"
+
+          if [ "${{ steps.lic.outputs.drift }}" = "true" ]; then
+            # 漂移未确认：把「待确认值」提交上去，方便在 issue 里对照，但不动基线。
+            if [ -f .mirror-baseline.pending.json ]; then
+              git add -f .mirror-baseline.pending.json
+              if ! git diff --cached --quiet; then
+                git commit -q -m "chore: record pending upstream license snapshot (awaiting review)"
+                git push -q origin HEAD:main || echo "::warning::pending 文件推送失败"
+              fi
+            fi
+            echo "漂移未确认，基线保持不动"
+            exit 0
+          fi
+
           if [ ! -f .mirror-baseline.json ]; then
             echo "没有基线文件，跳过"
             exit 0
           fi
-          git config user.name  "mika-mirror-bot"
-          git config user.email "mika-mirror-bot@users.noreply.github.com"
           git add .mirror-baseline.json
+          if [ -f .mirror-baseline.pending.json ]; then
+            git rm -q --cached .mirror-baseline.pending.json 2>/dev/null || true
+            rm -f .mirror-baseline.pending.json
+          fi
           if git diff --cached --quiet; then
             echo "基线与仓库一致，无需提交"
             exit 0
@@ -334,11 +366,13 @@ jobs:
           BODY=$(printf '自动巡检发现上游 [wangzan101/Mika](https://github.com/wangzan101/Mika) 的许可信息与上次记录不一致。\n\n### 变化\n%s\n### 当前记录\n- license 字段：`%s`\n- archived：`%s`\n\n### 需要做什么\n1. 打开上游 LICENSE / NOTICE 确认是否真的改了（不是抓取失败导致的误报）。\n2. 若确实变更：更新本仓库 `MIRROR.md` 里的许可说明，确认镜像继续分发是否仍然合规。\n3. 若不再合规：删除对应 Release 附件或整个仓库。\n4. 确认完毕后关闭本 issue；关闭后不会再重复告警（基线已同步更新）。\n\n> 本 issue 由 `.github/workflows/sync-upstream.yml` 自动创建，本次运行已标记为失败。' \
             "$REASON" "${{ steps.lic.outputs.spdx }}" "${{ steps.lic.outputs.archived }}")
 
-          EXISTING=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/search/issues?q=$(printf 'repo:%s+is:issue+is:open+in:title+许可信息发生变化' "$REPO")" \
-            | jq -r '.total_count // 0')
+          # 用列表接口 + jq 过滤，避免把中文塞进搜索查询串（未编码会 4xx）
+          EXISTING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/issues?state=open&per_page=100" \
+            | jq '[.[] | select(.pull_request == null) | select(.title | contains("许可信息发生变化"))] | length' 2>/dev/null || echo 0)
+          echo "已存在的同类 issue 数：$EXISTING"
 
-          if [ "$EXISTING" != "0" ]; then
+          if [ "${EXISTING:-0}" != "0" ]; then
             echo "已有未关闭的同类 issue，不再重复创建"
           else
             code=$(curl -sS -o /tmp/issue.json -w '%{http_code}' -X POST \
@@ -346,6 +380,7 @@ jobs:
               -d "$(jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t,body:$b}')" \
               "https://api.github.com/repos/$REPO/issues")
             echo "创建 issue http=$code $(jq -r '.html_url // .message' /tmp/issue.json)"
+            [ "$code" = "201" ] || echo "::warning::issue 创建失败，http=$code"
           fi
 
           {
